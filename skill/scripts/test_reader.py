@@ -100,5 +100,141 @@ class ReaderTests(unittest.TestCase):
                     reader.ingest(args)
             self.assertEqual(len(list((Path(t)/'cache').rglob('source.pdf'))), 1)
 
+
+class OriginalStorageTests(unittest.TestCase):
+    PDF = b'%PDF-1.4\noriginal fixture'
+
+    def complete(self, base, network=False, archived_pdf=True, before_result=None):
+        from unittest.mock import Mock
+        pdf = base / 'input.pdf'
+        pdf.write_bytes(self.PDF)
+        args = argparse.Namespace(source='https://example.org/paper.pdf' if network else str(pdf),
+            cache_root=str(base/'cache'), project=str(base/'project'), title='Paper',
+            language='en', ocr=False, wait=0, recover=False)
+        def download(url, dest, limit=200*1024*1024):
+            if url.endswith('paper.pdf'):
+                dest.write_bytes(self.PDF)
+                return url
+            if before_result:
+                before_result(pdf)
+            with zipfile.ZipFile(dest, 'w') as z:
+                z.writestr('full.md', '# Paper')
+                z.writestr('content_list.json', '[]')
+                z.writestr('images/figure.png', b'image fixture')
+                z.writestr('layout.pdf', b'%PDF-1.4\ndifferent annotated PDF')
+                if archived_pdf is not False:
+                    data = self.PDF if archived_pdf is True else archived_pdf
+                    z.writestr('nested/paper_origin.pdf', data)
+                    z.writestr('second_origin.pdf', data)
+        responses = [{'batch_id': 'batch', 'file_urls': ['https://example.org/upload']},
+            {'extract_result': [{'state': 'done', 'full_zip_url': 'https://example.org/result.zip'}]}]
+        with patch.object(reader, 'api', side_effect=responses), patch.object(reader, 'get_token', return_value='fake'), patch.object(reader.requests, 'put', return_value=Mock(status_code=200)), patch.object(reader, 'download', side_effect=download):
+            result = reader.ingest(args)
+        return pdf, args, result, Path(result['directory'])
+
+    def test_local_retention_and_offline_reuse(self):
+        with tempfile.TemporaryDirectory() as t:
+            pdf, args, result, folder = self.complete(Path(t))
+            self.assertEqual(Path(result['original_pdf']), pdf.resolve())
+            self.assertEqual(pdf.read_bytes(), self.PDF)
+            self.assertFalse((folder/'source.pdf').exists())
+            self.assertFalse((folder/'mineru_raw/nested/paper_origin.pdf').exists())
+            self.assertFalse((folder/'mineru_raw/second_origin.pdf').exists())
+            self.assertTrue((folder/'mineru_raw/layout.pdf').is_file())
+            self.assertTrue((folder/'mineru_raw/images/figure.png').is_file())
+            with patch.object(reader, 'get_token', side_effect=AssertionError('no token')), patch.object(reader, 'api', side_effect=AssertionError('no API')):
+                self.assertEqual(reader.ingest(args)['original_pdf'], str(pdf.resolve()))
+                self.assertEqual(reader.resolve_original(args.cache_root, result['cache_id'])['original_pdf'], str(pdf.resolve()))
+
+    def test_network_keeps_one_extracted_original(self):
+        with tempfile.TemporaryDirectory() as t:
+            _, args, result, folder = self.complete(Path(t), network=True)
+            self.assertFalse((folder/'source.pdf').exists())
+            self.assertEqual(Path(result['original_pdf']).read_bytes(), self.PDF)
+            originals = [p for p in folder.rglob('*.pdf') if p.read_bytes() == self.PDF]
+            self.assertEqual(len(originals), 1)
+            self.assertTrue(originals[0].is_relative_to(folder/'mineru_raw'))
+            reader.verify_cache(folder, reader.read(folder/'manifest.json'))
+
+    def test_missing_or_changed_local_restores_without_upload(self):
+        for changed in (False, True):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as t:
+                pdf, args, result, folder = self.complete(Path(t))
+                if changed:
+                    pdf.write_bytes(b'%PDF-1.4\nnew revision')
+                else:
+                    pdf.unlink()
+                with patch.object(reader, 'get_token', side_effect=AssertionError('no token')), patch.object(reader, 'api', side_effect=AssertionError('no API')):
+                    restored = Path(reader.resolve_original(args.cache_root, result['cache_id'])['original_pdf'])
+                    self.assertEqual(restored.read_bytes(), self.PDF)
+                    self.assertEqual(restored.parent, folder)
+                    self.assertEqual(reader.resolve_original(args.cache_root, result['cache_id'])['original_pdf'], str(restored))
+                if changed:
+                    self.assertEqual(pdf.read_bytes(), b'%PDF-1.4\nnew revision')
+                else:
+                    self.assertFalse(pdf.exists())
+                reader.verify_cache(folder, reader.read(folder/'manifest.json'))
+
+    def test_no_identical_zip_original_preserves_snapshot(self):
+        for archive_value in (False, b'%PDF-1.4\nwrong version'):
+            for network in (False, True):
+                with self.subTest(value=archive_value, network=network), tempfile.TemporaryDirectory() as t:
+                    pdf, args, result, folder = self.complete(Path(t), network=network, archived_pdf=archive_value)
+                    self.assertEqual((folder/'source.pdf').read_bytes(), self.PDF)
+                    pdf.unlink()
+                    original = reader.resolve_original(args.cache_root, result['cache_id'])['original_pdf']
+                    self.assertEqual(Path(original), folder/'source.pdf')
+
+    def test_input_changes_during_parse_keeps_extracted_original(self):
+        with tempfile.TemporaryDirectory() as t:
+            pdf, args, result, folder = self.complete(Path(t), before_result=lambda p: p.write_bytes(b'changed'))
+            self.assertEqual(pdf.read_bytes(), b'changed')
+            self.assertEqual(Path(result['original_pdf']).read_bytes(), self.PDF)
+            self.assertFalse((folder/'source.pdf').exists())
+
+    def test_corrupt_zip_blocks_recovery(self):
+        with tempfile.TemporaryDirectory() as t:
+            pdf, args, result, folder = self.complete(Path(t))
+            pdf.unlink()
+            (folder/'result.zip').write_bytes(b'corrupted')
+            with self.assertRaisesRegex(RuntimeError, 'CACHE_DAMAGED'):
+                reader.resolve_original(args.cache_root, result['cache_id'])
+            self.assertFalse((folder/'restored-original.pdf').exists())
+
+    def test_legacy_done_cache_is_not_cleaned(self):
+        with tempfile.TemporaryDirectory() as t:
+            pdf, args, result, folder = self.complete(Path(t), archived_pdf=False)
+            m = reader.read(folder/'manifest.json')
+            for name in ('original', 'source_kind', 'local_source'):
+                m.pop(name, None)
+            reader.save(folder/'manifest.json', m)
+            reader.ingest(args)
+            self.assertTrue((folder/'source.pdf').exists())
+            self.assertNotIn('original', reader.read(folder/'manifest.json'))
+
+    def test_cleanup_interruption_is_resumable(self):
+        with tempfile.TemporaryDirectory() as t:
+            base = Path(t)
+            unlink = Path.unlink
+            def fail_source(path, *a, **kw):
+                if path.name == 'source.pdf' and path.parent.parent.name == 'documents':
+                    raise OSError('simulated interrupted cleanup')
+                return unlink(path, *a, **kw)
+            with patch.object(Path, 'unlink', fail_source), self.assertRaises(OSError):
+                self.complete(base)
+            folder = next((base/'cache/documents').iterdir())
+            m = reader.read(folder/'manifest.json')
+            self.assertEqual(m['state'], 'done')
+            self.assertTrue(m['original_cleanup_pending'])
+            result = reader.resolve_original(base/'cache', m['cache_id'])
+            self.assertEqual(Path(result['original_pdf']), (base/'input.pdf').resolve())
+            self.assertFalse((folder/'source.pdf').exists())
+            self.assertNotIn('original_cleanup_pending', reader.read(folder/'manifest.json'))
+
+    def test_invalid_cache_id(self):
+        with tempfile.TemporaryDirectory() as t:
+            with self.assertRaisesRegex(RuntimeError, 'Invalid cache ID'):
+                reader.resolve_original(t, '../escape')
+
 if __name__ == '__main__':
     unittest.main()
